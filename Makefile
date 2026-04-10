@@ -11,6 +11,11 @@ win32:
 	rm -rf out-mingw64 && mkdir out-mingw64 && cp lib/simplehttpx64.dll out-mingw64/simplehttp.dll && cp lib/iconvx64.dll out-mingw64/iconv.dll
 	zip -r win32-lua5.4.zip out-mingw out-mingw64 scripts README.md
 
+linux-linked:
+	cd lib && make clean simplehttp.so iconv.so LUALINK=-llua5.4
+	rm -rf out-linux-linked && mkdir out-linux-linked && cp lib/simplehttp.so lib/iconv.so out-linux-linked
+	tar czvf linux-`uname -m`-lua5.4-linked.tar.gz out-linux-linked scripts README.md
+
 macos:
 	cd lib && make PLAT=macos clean simplehttp.so iconv.so
 	rm -rf out-macos && mkdir out-macos && cp lib/simplehttp.so lib/iconv.so out-macos

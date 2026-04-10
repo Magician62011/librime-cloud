@@ -1,0 +1,6 @@
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update
+RUN apt-get install -qq ca-certificates --no-install-recommends
+RUN update-ca-certificates
+RUN apt-get install -qq git curl build-essential unzip zip liblua5.4-dev --no-install-recommends

@@ -6,6 +6,7 @@ LUAV ?= 5.4
 LUAINC = thirdparty/lua${LUAV}
 LUALIB = -Llibrime-lua${LUAV}/dist/lib -lrime
 LUALIB64 = -Llibrime-lua${LUAV}-x64/dist/lib -lrime
+LUALINK ?=
 
 CURLV ?= 8.11.1
 CURLINC = curl-${CURLV}/include
@@ -50,6 +51,8 @@ lua-iconv-${LUA_ICONV_V}:
 
 prepare: librime-lua5.4 librime-lua5.4-x64 thirdparty curl-${CURLV} lua-iconv-${LUA_ICONV_V}
 
+prepare-linux-linked: thirdparty curl-${CURLV} lua-iconv-${LUA_ICONV_V}
+
 curl-${CURLV}/build32/lib/.libs: curl-${CURLV}
 	cd curl-${CURLV} && sh ../tinycurl.sh
 
@@ -63,7 +66,7 @@ libiconv-${ICONV_V}/build64/lib/.libs: libiconv-${ICONV_V}
 	cd libiconv-${ICONV_V} && sh ../iconvx64.sh
 
 simplehttp.so: main.c thirdparty curl-${CURLV}
-	${CC} -I${LUAINC} -I${CURLINC} -Os -fPIC -shared ${LDFLAGS} -o $@ $<
+	${CC} -I${LUAINC} -I${CURLINC} -Os -fPIC -shared ${LDFLAGS} -o $@ $< ${LUALINK}
 
 simplehttp.dll: main.c librime-lua${LUAV} thirdparty curl-${CURLV}/build32/lib/.libs
 	${CC_mingw} -I${LUAINC} -I${CURLINC} -Os -shared -o $@ $< -Wl,--gc-sections -Wl,-s -static-libgcc ${LUALIB} ${CURLLIB}
@@ -74,7 +77,7 @@ simplehttpx64.dll: main.c librime-lua${LUAV}-x64 thirdparty curl-${CURLV}/build6
 lua-iconv-${LUA_ICONV_V}/luaiconv.c: lua-iconv-${LUA_ICONV_V}
 
 iconv.so: lua-iconv-${LUA_ICONV_V}/luaiconv.c
-	${CC} -I${LUAINC} -Os -fPIC -shared ${LDFLAGS} -o $@ $<
+	${CC} -I${LUAINC} -Os -fPIC -shared ${LDFLAGS} -o $@ $< ${LUALINK}
 
 iconv.dll: lua-iconv-${LUA_ICONV_V}/luaiconv.c librime-lua${LUAV} libiconv-${ICONV_V}/build32/lib/.libs
 	${CC_mingw} -I${LUAINC} -I${ICONV_INC} -Os -shared -o $@ $< -Wl,--gc-sections -Wl,-s -static-libgcc ${LUALIB} ${ICONV_LIB}

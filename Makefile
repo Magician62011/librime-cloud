@@ -1,4 +1,4 @@
-all: linux win32
+all: linux win32 android
 
 linux:
 	cd lib && make clean simplehttp.so iconv.so
@@ -16,8 +16,14 @@ macos:
 	rm -rf out-macos && mkdir out-macos && cp lib/simplehttp.so lib/iconv.so out-macos
 	tar czvf macos-`uname -m`-lua5.4.tar.gz out-macos scripts README.md
 
+android:
+	cd lib && make clean simplehttp-android.so
+	rm -rf out-android && mkdir out-android
+	cp lib/simplehttp-android.so out-android/simplehttp.so
+	tar czvf android-arm64-v8a-lua5.4.tar.gz out-android scripts README.md
+
 clean:
-	rm -rf out-mingw out-linux out-macos linux-*.tar.gz win32-*.zipa macos-*.tar.gz
+	rm -rf out-mingw out-linux out-macos out-android linux-*.tar.gz win32-*.zip macos-*.tar.gz android-*.tar.gz
 
 purge: clean
 	cd lib && make purge

@@ -1,0 +1,28 @@
+name: build-android
+
+on:
+  push:
+    branches:
+      - android-simplehttp
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build_android:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: prepare (Lua headers via thirdparty + Lua 5.4 source for link-time stub)
+      working-directory: lib
+      run: make prepare-android
+
+    - name: build simplehttp.so for Android arm64-v8a
+      run: make android NDK=$ANDROID_NDK_ROOT
+
+    - name: upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: android-arm64-v8a
+        path: android-arm64-v8a-lua5.4.tar.gz

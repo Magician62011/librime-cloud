@@ -6,10 +6,11 @@
  * handled automatically by Android's Conscrypt/BoringSSL stack — no
  * certificate bundle needed.
  *
- * Lua symbols (lua_State, luaL_checkstring, etc.) are provided at
- * runtime by librime.so, which statically links Lua 5.4. This file is
- * linked at build time against a Lua stub named librime.so; at runtime
- * the real librime.so from the fcitx5-android RIME plugin is used.
+ * Lua symbols are resolved at runtime via dladdr + dlopen(RTLD_NOLOAD)
+ * + dlsym. This means simplehttp.so has ZERO undefined Lua symbols at
+ * link time and needs no NEEDED entry for librime.so. At runtime,
+ * luaopen_simplehttp() finds the calling library (librime.so) via the
+ * return address and resolves every Lua API function by name.
  *
  * API compatible with simplehttp (main.c):
  *   http.request(url)                    → body, code
@@ -22,9 +23,71 @@
 #include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
+#include <android/log.h>
 
-#include <lua.h>
-#include <lauxlib.h>
+/* ------------------------------------------------------------------ */
+/* Lua types and constants — no linking required                       */
+/* ------------------------------------------------------------------ */
+
+typedef struct lua_State lua_State;
+typedef double           lua_Number;
+typedef long long        lua_Integer;
+typedef int (*lua_CFunction)(lua_State *L);
+
+#define LUA_REGISTRYINDEX   (-1000000 - 1000)
+#define lua_upvalueindex(i) (LUA_REGISTRYINDEX - (i))
+
+/* lua_type return values */
+#define LUA_TNONE          (-1)
+#define LUA_TNIL            0
+#define LUA_TBOOLEAN        1
+#define LUA_TLIGHTUSERDATA  2
+#define LUA_TNUMBER         3
+#define LUA_TSTRING         4
+#define LUA_TTABLE          5
+#define LUA_TFUNCTION       6
+#define LUA_TUSERDATA       7
+#define LUA_TTHREAD         8
+
+/* ------------------------------------------------------------------ */
+/* Lua API function pointer table                                      */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    /* stack manipulation */
+    void        (*lua_settop)      (lua_State *L, int idx);
+    void        (*lua_pushnil)     (lua_State *L);
+    const char *(*lua_pushstring)  (lua_State *L, const char *s);
+    const char *(*lua_pushlstring) (lua_State *L, const char *s, size_t len);
+    void        (*lua_pushinteger) (lua_State *L, lua_Integer n);
+    void        (*lua_pushvalue)   (lua_State *L, int idx);
+    void        (*lua_pushcclosure)(lua_State *L, lua_CFunction fn, int n);
+    /* table */
+    void        (*lua_createtable) (lua_State *L, int narr, int nrec);
+    int         (*lua_getfield)    (lua_State *L, int idx, const char *k);
+    void        (*lua_setfield)    (lua_State *L, int idx, const char *k);
+    /* type / value query */
+    int         (*lua_type)        (lua_State *L, int idx);
+    int         (*lua_isstring)    (lua_State *L, int idx);
+    lua_Number  (*lua_tonumberx)   (lua_State *L, int idx, int *isnum);
+    const char *(*lua_tolstring)   (lua_State *L, int idx, size_t *len);
+    /* aux lib */
+    const char *(*luaL_checklstring)(lua_State *L, int arg, size_t *l);
+} LuaAPI;
+
+static LuaAPI lapi;          /* zero-initialised; populated in luaopen_ */
+static int    lapi_ready = 0;
+
+/* Convenience wrappers matching standard Lua macros */
+#define lua_pop(L,n)           lapi.lua_settop((L), -(n)-1)
+#define lua_newtable(L)        lapi.lua_createtable((L), 0, 0)
+#define lua_isnoneornil(L,n)   (lapi.lua_type((L),(n)) <= 0)
+#define lua_istable(L,n)       (lapi.lua_type((L),(n)) == LUA_TTABLE)
+#define lua_tostring(L,i)      lapi.lua_tolstring((L),(i),NULL)
+
+/* ------------------------------------------------------------------ */
+/* JVM helpers                                                         */
+/* ------------------------------------------------------------------ */
 
 /* Obtain the JVM running in this process.
    On Android, the JVM is always present (started by the app framework).
@@ -39,9 +102,11 @@ static JavaVM *get_jvm(void) {
     return count > 0 ? vms[0] : NULL;
 }
 
+/* ------------------------------------------------------------------ */
+/* HTTP request via java.net.HttpURLConnection                         */
+/* ------------------------------------------------------------------ */
+
 /*
- * Perform an HTTP(S) request via java.net.HttpURLConnection.
- *
  * Pushes 2 values onto the Lua stack:
  *   success: body_string, status_code
  *   failure: nil, error_string
@@ -54,8 +119,8 @@ static int do_request(lua_State *L,
                       jint       timeout_ms) {
     JavaVM *jvm = get_jvm();
     if (!jvm) {
-        lua_pushnil(L);
-        lua_pushstring(L, "simplehttp: JVM not available");
+        lapi.lua_pushnil(L);
+        lapi.lua_pushstring(L, "simplehttp: JVM not available");
         return 2;
     }
 
@@ -64,14 +129,14 @@ static int do_request(lua_State *L,
     jint rc = (*jvm)->GetEnv(jvm, (void **)&env, JNI_VERSION_1_6);
     if (rc == JNI_EDETACHED) {
         if ((*jvm)->AttachCurrentThread(jvm, &env, NULL) != JNI_OK) {
-            lua_pushnil(L);
-            lua_pushstring(L, "simplehttp: cannot attach thread to JVM");
+            lapi.lua_pushnil(L);
+            lapi.lua_pushstring(L, "simplehttp: cannot attach thread to JVM");
             return 2;
         }
         attached = JNI_TRUE;
     } else if (rc != JNI_OK) {
-        lua_pushnil(L);
-        lua_pushstring(L, "simplehttp: cannot get JNI env");
+        lapi.lua_pushnil(L);
+        lapi.lua_pushstring(L, "simplehttp: cannot get JNI env");
         return 2;
     }
 
@@ -159,8 +224,8 @@ static int do_request(lua_State *L,
            Return empty body with the error code so the Lua caller
            can check the status and discard gracefully. */
         (*env)->ExceptionClear(env);
-        lua_pushlstring(L, "", 0);
-        lua_pushinteger(L, (lua_Integer)code);
+        lapi.lua_pushlstring(L, "", 0);
+        lapi.lua_pushinteger(L, (lua_Integer)code);
         goto cleanup;
     }
 
@@ -177,13 +242,13 @@ static int do_request(lua_State *L,
     }
     (*env)->CallVoidMethod(env, is_obj, IS_close);
 
-    lua_pushlstring(L, body ? body : "", body_len);
-    lua_pushinteger(L, (lua_Integer)code);
+    lapi.lua_pushlstring(L, body ? body : "", body_len);
+    lapi.lua_pushinteger(L, (lua_Integer)code);
     goto cleanup;
 
 fail:
-    lua_pushnil(L);
-    lua_pushstring(L, "simplehttp: request failed");
+    lapi.lua_pushnil(L);
+    lapi.lua_pushstring(L, "simplehttp: request failed");
 
 cleanup:
     free(body);
@@ -205,8 +270,11 @@ cleanup:
     return 2;
 }
 
-/* Lua-facing entry point.
-   Upvalue 1 = the module table (for reading TIMEOUT). */
+/* ------------------------------------------------------------------ */
+/* Lua-facing entry point                                              */
+/* ------------------------------------------------------------------ */
+
+/* Upvalue 1 = the module table (for reading TIMEOUT). */
 static int w_request(lua_State *L) {
     const char *url      = NULL;
     const char *method   = "GET";
@@ -215,51 +283,123 @@ static int w_request(lua_State *L) {
     jint        timeout_ms = 0;
 
     /* Read TIMEOUT from module table */
-    lua_getfield(L, lua_upvalueindex(1), "TIMEOUT");
+    lapi.lua_getfield(L, lua_upvalueindex(1), "TIMEOUT");
     if (!lua_isnoneornil(L, -1))
-        timeout_ms = (jint)(lua_tonumber(L, -1) * 1000.0);
+        timeout_ms = (jint)(lapi.lua_tonumberx(L, -1, NULL) * 1000.0);
     lua_pop(L, 1);
 
-    if (lua_isstring(L, 1)) {
+    if (lapi.lua_isstring(L, 1)) {
         /* http.request(url [, post_body]) */
         size_t url_len;
-        url = luaL_checklstring(L, 1, &url_len);
-        if (lua_isstring(L, 2)) {
-            post_data = luaL_checklstring(L, 2, &post_len);
+        url = lapi.luaL_checklstring(L, 1, &url_len);
+        if (lapi.lua_isstring(L, 2)) {
+            post_data = lapi.luaL_checklstring(L, 2, &post_len);
             method = "POST";
         }
     } else if (lua_istable(L, 1)) {
         /* http.request({url=, method=, data=}) */
-        lua_getfield(L, 1, "url");
+        lapi.lua_getfield(L, 1, "url");
         size_t url_len;
-        url = luaL_checklstring(L, -1, &url_len);
+        url = lapi.luaL_checklstring(L, -1, &url_len);
         /* Leave url on stack to keep the pointer valid */
 
-        lua_getfield(L, 1, "method");
+        lapi.lua_getfield(L, 1, "method");
         if (!lua_isnoneornil(L, -1))
             method = lua_tostring(L, -1);
         /* Leave method on stack */
 
-        lua_getfield(L, 1, "data");
+        lapi.lua_getfield(L, 1, "data");
         if (!lua_isnoneornil(L, -1)) {
-            post_data = luaL_checklstring(L, -1, &post_len);
+            post_data = lapi.luaL_checklstring(L, -1, &post_len);
             if (strcmp(method, "GET") == 0) method = "POST";
         }
         /* Leave data on stack */
     } else {
-        lua_pushnil(L);
-        lua_pushstring(L, "simplehttp: expected url string or request table");
+        lapi.lua_pushnil(L);
+        lapi.lua_pushstring(L, "simplehttp: expected url string or request table");
         return 2;
     }
 
     return do_request(L, url, method, post_data, (jsize)post_len, timeout_ms);
 }
 
+/* ------------------------------------------------------------------ */
+/* Resolve Lua API from the calling library at runtime                 */
+/* ------------------------------------------------------------------ */
+
+#define RESOLVE(name) \
+    do { \
+        lapi.name = (typeof(lapi.name))dlsym(h, #name); \
+        if (!lapi.name) { \
+            __android_log_print(ANDROID_LOG_ERROR, "simplehttp", \
+                "dlsym(" #name ") failed: %s", dlerror()); \
+            dlclose(h); \
+            return -1; \
+        } \
+    } while (0)
+
+static int resolve_lua_api(void) {
+    /* Find the library that called luaopen_simplehttp.
+       One level up: luaopen_simplehttp <- Lua loader in librime.so */
+    void *ret = __builtin_return_address(0);
+    Dl_info info;
+    if (!dladdr(ret, &info) || !info.dli_fname) {
+        __android_log_print(ANDROID_LOG_ERROR, "simplehttp",
+            "dladdr failed to identify caller library");
+        return -1;
+    }
+
+    __android_log_print(ANDROID_LOG_DEBUG, "simplehttp",
+        "caller library: %s", info.dli_fname);
+
+    /* RTLD_NOLOAD: don't load, just get handle to the already-loaded lib */
+    void *h = dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD);
+    if (!h) {
+        __android_log_print(ANDROID_LOG_ERROR, "simplehttp",
+            "dlopen(RTLD_NOLOAD) failed: %s", dlerror());
+        return -1;
+    }
+
+    RESOLVE(lua_settop);
+    RESOLVE(lua_pushnil);
+    RESOLVE(lua_pushstring);
+    RESOLVE(lua_pushlstring);
+    RESOLVE(lua_pushinteger);
+    RESOLVE(lua_pushvalue);
+    RESOLVE(lua_pushcclosure);
+    RESOLVE(lua_createtable);
+    RESOLVE(lua_getfield);
+    RESOLVE(lua_setfield);
+    RESOLVE(lua_type);
+    RESOLVE(lua_isstring);
+    RESOLVE(lua_tonumberx);
+    RESOLVE(lua_tolstring);
+    RESOLVE(luaL_checklstring);
+
+    dlclose(h);  /* release the extra ref; the library stays loaded */
+    return 0;
+}
+
+#undef RESOLVE
+
+/* ------------------------------------------------------------------ */
+/* Module entry point                                                  */
+/* ------------------------------------------------------------------ */
+
 __attribute__((visibility("default")))
 int luaopen_simplehttp(lua_State *L) {
+    if (!lapi_ready) {
+        if (resolve_lua_api() != 0) {
+            /* Can't push error via Lua API if it's not resolved yet.
+               Return 0 so Lua gets nil from require(). */
+            return 0;
+        }
+        lapi_ready = 1;
+    }
+
     lua_newtable(L);
-    lua_pushvalue(L, -1);           /* upvalue 1: the module table itself */
-    lua_pushcclosure(L, w_request, 1);
-    lua_setfield(L, -2, "request");
+    lapi.lua_pushvalue(L, -1);           /* upvalue 1: the module table itself */
+    lapi.lua_pushcclosure(L, w_request, 1);
+    lapi.lua_setfield(L, -2, "request");
     return 1;
 }

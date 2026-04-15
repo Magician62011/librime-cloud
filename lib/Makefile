@@ -56,20 +56,20 @@ NDK_CLANG = $(NDK)/toolchains/llvm/prebuilt/linux-x86_64/bin/$(ANDROID_TRIPLE)$(
 
 prepare: librime-lua5.4 librime-lua5.4-x64 thirdparty curl-${CURLV} lua-iconv-${LUA_ICONV_V}
 
-prepare-android: thirdparty
+prepare-android:
 
 # Android arm64-v8a build of simplehttp.
-# Lua symbols are left undefined at link time (--allow-shlib-undefined).
-# At runtime the already-loaded librime.so in the classloader-namespace
-# provides all Lua symbols — no NEEDED=librime.so file lookup needed.
-simplehttp-android.so: simplehttp_android.c thirdparty
+# No Lua headers needed: all Lua API calls go through function pointers
+# resolved at runtime via dladdr + dlopen(RTLD_NOLOAD) + dlsym inside
+# luaopen_simplehttp(). This means zero undefined Lua symbols at link time
+# and no NEEDED=librime.so entry — the Android linker never has to locate
+# librime.so as a file; we just reuse the already-loaded handle.
+simplehttp-android.so: simplehttp_android.c
 	$(NDK_CLANG) -shared -fPIC \
-		-I$(LUAINC) \
 		-Os -Wl,-s \
 		-Wl,-soname,simplehttp.so \
-		-Wl,--allow-shlib-undefined \
 		-o $@ simplehttp_android.c \
-		-llog
+		-llog -ldl
 
 curl-${CURLV}/build32/lib/.libs: curl-${CURLV}
 	cd curl-${CURLV} && sh ../tinycurl.sh

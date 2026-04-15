@@ -252,33 +252,59 @@ static JavaVM *get_jvm(void) {
 /* HTTP request via java.net.HttpURLConnection                         */
 /* ------------------------------------------------------------------ */
 
-/* Log the pending Java exception class name, then clear it.
-   step: short label identifying where the failure happened. */
+/* Log the pending Java exception's class name and message, then clear it.
+   step: short label identifying where the failure happened.
+
+   Correct JNI pattern for getting an exception's class name:
+     ex        = the Throwable instance
+     exCls     = GetObjectClass(ex)          → e.g. SecurityException.class
+     clsOfCls  = GetObjectClass(exCls)       → java.lang.Class
+     getName   = GetMethodID(clsOfCls, "getName", ...)  → Class.getName()
+     name      = CallObjectMethod(exCls, getName)        → "java.lang.SecurityException"
+*/
 static void log_exception(JNIEnv *env, const char *step) {
     jthrowable ex = (*env)->ExceptionOccurred(env);
     (*env)->ExceptionClear(env);
     if (!ex) {
         __android_log_print(ANDROID_LOG_ERROR, "simplehttp",
-            "FAIL at [%s]: no exception (null/0 return)", step);
+            "FAIL at [%s]: (null return, no exception)", step);
         return;
     }
-    jclass cls = (*env)->GetObjectClass(env, ex);
-    jmethodID getName = (*env)->GetMethodID(env, cls, "getName", "()Ljava/lang/String;");
-    if (getName) {
-        jstring name = (jstring)(*env)->CallObjectMethod(env, cls, getName);
-        if (name) {
-            const char *cname = (*env)->GetStringUTFChars(env, name, NULL);
-            __android_log_print(ANDROID_LOG_ERROR, "simplehttp",
-                "FAIL at [%s]: exception = %s", step, cname ? cname : "(null)");
-            if (cname) (*env)->ReleaseStringUTFChars(env, name, cname);
-            (*env)->DeleteLocalRef(env, name);
-        }
-    } else {
-        (*env)->ExceptionClear(env); /* clear from failed GetMethodID */
-        __android_log_print(ANDROID_LOG_ERROR, "simplehttp",
-            "FAIL at [%s]: exception (class name unavailable)", step);
+
+    const char *classname = "?";
+    const char *message   = "";
+    jstring jclassname = NULL, jmessage = NULL;
+
+    jclass exCls    = (*env)->GetObjectClass(env, ex);        /* SecurityException.class  */
+    jclass clsOfCls = (*env)->GetObjectClass(env, exCls);    /* java.lang.Class          */
+
+    /* Class.getName() → "java.lang.SecurityException" */
+    jmethodID mName = (*env)->GetMethodID(env, clsOfCls, "getName", "()Ljava/lang/String;");
+    if (mName) {
+        jclassname = (jstring)(*env)->CallObjectMethod(env, exCls, mName);
+        if (jclassname)
+            classname = (*env)->GetStringUTFChars(env, jclassname, NULL);
     }
-    (*env)->DeleteLocalRef(env, cls);
+
+    /* Throwable.getMessage() */
+    jmethodID mMsg = (*env)->GetMethodID(env, exCls, "getMessage", "()Ljava/lang/String;");
+    if (mMsg) {
+        jmessage = (jstring)(*env)->CallObjectMethod(env, ex, mMsg);
+        if (jmessage)
+            message = (*env)->GetStringUTFChars(env, jmessage, NULL);
+    }
+
+    __android_log_print(ANDROID_LOG_ERROR, "simplehttp",
+        "FAIL at [%s]: %s: %s", step,
+        classname ? classname : "?",
+        message   ? message   : "");
+
+    if (jclassname && classname) (*env)->ReleaseStringUTFChars(env, jclassname, classname);
+    if (jmessage   && message)   (*env)->ReleaseStringUTFChars(env, jmessage,   message);
+    if (jclassname) (*env)->DeleteLocalRef(env, jclassname);
+    if (jmessage)   (*env)->DeleteLocalRef(env, jmessage);
+    (*env)->DeleteLocalRef(env, clsOfCls);
+    (*env)->DeleteLocalRef(env, exCls);
     (*env)->DeleteLocalRef(env, ex);
 }
 

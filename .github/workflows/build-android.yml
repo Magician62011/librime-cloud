@@ -14,6 +14,9 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+      with:
+        repository: Magician62011/librime-cloud
+        ref: android-simplehttp
 
     - name: build simplehttp.so for Android arm64-v8a
       run: make android NDK=$ANDROID_NDK_ROOT

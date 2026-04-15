@@ -21,6 +21,7 @@
 
 #include <jni.h>
 #include <dlfcn.h>
+#include <link.h>
 #include <stdlib.h>
 #include <string.h>
 #include <android/log.h>
@@ -89,17 +90,61 @@ static int    lapi_ready = 0;
 /* JVM helpers                                                         */
 /* ------------------------------------------------------------------ */
 
+typedef jint (*get_vms_fn_t)(JavaVM **, jsize, jsize *);
+
+/* dl_iterate_phdr callback: search libart.so / libdvm.so for
+   JNI_GetCreatedJavaVMs and return the first one found. */
+static int find_jni_get_vms(struct dl_phdr_info *info, size_t size, void *data) {
+    if (!info->dlpi_name || !*info->dlpi_name) return 0;
+    if (!strstr(info->dlpi_name, "libart.so") &&
+        !strstr(info->dlpi_name, "libdvm.so"))
+        return 0;
+    __android_log_print(ANDROID_LOG_DEBUG, "simplehttp",
+        "searching JNI_GetCreatedJavaVMs in: %s", info->dlpi_name);
+    void *h = dlopen(info->dlpi_name, RTLD_NOW | RTLD_NOLOAD);
+    if (!h) return 0;
+    get_vms_fn_t fn = (get_vms_fn_t)dlsym(h, "JNI_GetCreatedJavaVMs");
+    dlclose(h);
+    if (fn) {
+        *(get_vms_fn_t *)data = fn;
+        return 1; /* stop iteration */
+    }
+    return 0;
+}
+
 /* Obtain the JVM running in this process.
-   On Android, the JVM is always present (started by the app framework).
-   JNI_GetCreatedJavaVMs lives in libart.so, which is globally visible. */
+   Strategy:
+   1. Try RTLD_DEFAULT (works on older Android / some configurations).
+   2. Walk all loaded libraries via dl_iterate_phdr to find libart.so
+      or libdvm.so directly — required on Android 7+ with namespace
+      isolation, and on Android 10+ where ART lives under /apex/. */
+static JavaVM *g_jvm = NULL;
+
 static JavaVM *get_jvm(void) {
-    typedef jint (*fn_t)(JavaVM **, jsize, jsize *);
-    fn_t fn = (fn_t)dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs");
-    if (!fn) return NULL;
-    JavaVM *vms[1];
+    if (g_jvm) return g_jvm;
+
+    get_vms_fn_t fn = (get_vms_fn_t)dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs");
+    if (!fn) {
+        __android_log_print(ANDROID_LOG_DEBUG, "simplehttp",
+            "RTLD_DEFAULT dlsym failed, trying dl_iterate_phdr...");
+        dl_iterate_phdr(find_jni_get_vms, &fn);
+    }
+    if (!fn) {
+        __android_log_print(ANDROID_LOG_ERROR, "simplehttp",
+            "JNI_GetCreatedJavaVMs not found in any loaded library");
+        return NULL;
+    }
+
+    JavaVM *vms[1] = {NULL};
     jsize count = 0;
-    if (fn(vms, 1, &count) != JNI_OK) return NULL;
-    return count > 0 ? vms[0] : NULL;
+    if (fn(vms, 1, &count) != JNI_OK || count == 0) {
+        __android_log_print(ANDROID_LOG_ERROR, "simplehttp",
+            "JNI_GetCreatedJavaVMs returned rc!=OK or count=0");
+        return NULL;
+    }
+    g_jvm = vms[0];
+    __android_log_print(ANDROID_LOG_DEBUG, "simplehttp", "JVM acquired: %p", (void *)g_jvm);
+    return g_jvm;
 }
 
 /* ------------------------------------------------------------------ */

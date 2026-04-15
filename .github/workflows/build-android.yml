@@ -6,6 +6,7 @@ on:
       - android-simplehttp
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 jobs:
   build_android:

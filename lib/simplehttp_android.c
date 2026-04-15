@@ -90,59 +90,84 @@ static int    lapi_ready = 0;
 /* JVM helpers                                                         */
 /* ------------------------------------------------------------------ */
 
-/* Obtain the JVM running in this process.
- *
- * Strategy 1: RTLD_DEFAULT (works on Android < 7 / some configs).
- *
- * Strategy 2: libfcitx5android.so is loaded via System.loadLibrary so
- *   ART calls its JNI_OnLoad(JavaVM *jvm, ...) which stores the pointer
- *   in GlobalRef (a GlobalRefSingleton* whose first member at offset 0
- *   is JavaVM *jvm).  We walk loaded libraries with dl_iterate_phdr to
- *   find the library's full path, dlopen(RTLD_NOLOAD) it, and read the
- *   JavaVM out of GlobalRef->jvm.
- *
- * We do NOT try to dlopen libart.so: on Android 10+ it lives in the
- * com_android_art APEX namespace which is inaccessible from the
- * classloader-namespace even with RTLD_NOLOAD.
- */
 static JavaVM *g_jvm = NULL;
 
-static int find_jvm_in_fcitx(struct dl_phdr_info *info, size_t size, void *data) {
-    if (!info->dlpi_name || !strstr(info->dlpi_name, "libfcitx5android.so"))
-        return 0;
-    __android_log_print(ANDROID_LOG_DEBUG, "simplehttp",
-        "found libfcitx5android.so: %s", info->dlpi_name);
-    void *h = dlopen(info->dlpi_name, RTLD_NOW | RTLD_NOLOAD);
-    if (!h) {
-        /* fall back to basename lookup */
-        h = dlopen("libfcitx5android.so", RTLD_NOW | RTLD_NOLOAD);
-    }
-    if (!h) {
-        __android_log_print(ANDROID_LOG_ERROR, "simplehttp",
-            "dlopen(libfcitx5android.so, RTLD_NOLOAD) failed: %s", dlerror());
-        return 1; /* stop — no point searching further */
-    }
-    /* GlobalRef is extern GlobalRefSingleton *GlobalRef (jni-utils.h).
-       GlobalRefSingleton::jvm is its first member at byte offset 0. */
+/* Try to read JavaVM from GlobalRef->jvm exported by a handle.
+   GlobalRefSingleton::jvm is the first member at byte offset 0. */
+static JavaVM *jvm_from_globalref(void *h) {
     void *sym = dlsym(h, "GlobalRef");
-    if (sym) {
-        void *obj = *(void **)sym;   /* dereference: GlobalRefSingleton * */
-        if (obj) {
-            *(JavaVM **)data = *(JavaVM **)obj;  /* .jvm at offset 0 */
-            __android_log_print(ANDROID_LOG_DEBUG, "simplehttp",
-                "JVM from GlobalRef->jvm: %p", *(void **)data);
-        } else {
-            __android_log_print(ANDROID_LOG_ERROR, "simplehttp",
-                "GlobalRef is null (JNI_OnLoad not yet called?)");
-        }
-    } else {
-        __android_log_print(ANDROID_LOG_ERROR, "simplehttp",
-            "dlsym(GlobalRef) failed: %s", dlerror());
-    }
-    dlclose(h);
-    return 1; /* stop iteration */
+    if (!sym) return NULL;
+    void *obj = *(void **)sym;
+    if (!obj) return NULL;
+    return *(JavaVM **)obj;
 }
 
+/* dl_iterate_phdr callback: log all visible libraries (first 40) and
+   try to find JNI_GetCreatedJavaVMs or GlobalRef in each one. */
+typedef struct {
+    JavaVM *jvm;
+    int     count;
+} PhdrSearch;
+
+static int phdr_search_cb(struct dl_phdr_info *info, size_t size, void *data) {
+    PhdrSearch *s = (PhdrSearch *)data;
+    const char *name = (info->dlpi_name && *info->dlpi_name)
+                       ? info->dlpi_name : "(unnamed)";
+
+    /* Log first 40 libraries so we can see what's in our namespace */
+    if (s->count < 40)
+        __android_log_print(ANDROID_LOG_DEBUG, "simplehttp",
+            "phdr[%d]: %s", s->count, name);
+    s->count++;
+
+    if (!info->dlpi_name || !*info->dlpi_name) return 0;
+
+    void *h = dlopen(info->dlpi_name, RTLD_NOW | RTLD_NOLOAD);
+    if (!h) return 0;
+
+    /* Check for JNI_GetCreatedJavaVMs */
+    typedef jint (*fn_t)(JavaVM **, jsize, jsize *);
+    fn_t fn = (fn_t)dlsym(h, "JNI_GetCreatedJavaVMs");
+    if (fn) {
+        JavaVM *vms[1] = {NULL};
+        jsize count = 0;
+        if (fn(vms, 1, &count) == JNI_OK && count > 0) {
+            __android_log_print(ANDROID_LOG_DEBUG, "simplehttp",
+                "JVM via JNI_GetCreatedJavaVMs in %s", name);
+            s->jvm = vms[0];
+            dlclose(h);
+            return 1;
+        }
+    }
+
+    /* Check for GlobalRef (fcitx5android pattern) */
+    JavaVM *jvm = jvm_from_globalref(h);
+    if (jvm) {
+        __android_log_print(ANDROID_LOG_DEBUG, "simplehttp",
+            "JVM via GlobalRef->jvm in %s", name);
+        s->jvm = jvm;
+        dlclose(h);
+        return 1;
+    }
+
+    dlclose(h);
+    return 0;
+}
+
+/* Obtain the JVM running in this process.
+ *
+ * Strategy 1 — RTLD_DEFAULT: works on some Android versions where
+ *   JNI_GetCreatedJavaVMs is globally visible.
+ *
+ * Strategy 2 — direct dlopen by name: try well-known library names
+ *   without going through dl_iterate_phdr, in case they are accessible
+ *   by name from our namespace even if not visible in phdr iteration.
+ *   Includes libfcitx5android.so (stores JavaVM in GlobalRef->jvm).
+ *
+ * Strategy 3 — dl_iterate_phdr scan: walk every library visible in
+ *   our namespace, log them all for debugging, and try both
+ *   JNI_GetCreatedJavaVMs and GlobalRef->jvm in each one.
+ */
 static JavaVM *get_jvm(void) {
     if (g_jvm) return g_jvm;
 
@@ -160,17 +185,66 @@ static JavaVM *get_jvm(void) {
                 return g_jvm;
             }
         }
+        __android_log_print(ANDROID_LOG_DEBUG, "simplehttp",
+            "strategy 1 (RTLD_DEFAULT) failed");
     }
 
-    /* Strategy 2: read GlobalRef->jvm from libfcitx5android.so */
+    /* Strategy 2: try well-known library names directly */
+    {
+        static const char *const candidates[] = {
+            "libfcitx5android.so",
+            "libnativehelper.so",
+            "libandroid_runtime.so",
+            NULL
+        };
+        for (int i = 0; candidates[i]; i++) {
+            void *h = dlopen(candidates[i], RTLD_NOW | RTLD_NOLOAD);
+            if (!h) {
+                __android_log_print(ANDROID_LOG_DEBUG, "simplehttp",
+                    "strategy 2: dlopen(%s) failed: %s", candidates[i], dlerror());
+                continue;
+            }
+            /* Try JNI_GetCreatedJavaVMs */
+            typedef jint (*fn_t)(JavaVM **, jsize, jsize *);
+            fn_t fn = (fn_t)dlsym(h, "JNI_GetCreatedJavaVMs");
+            if (fn) {
+                JavaVM *vms[1] = {NULL};
+                jsize count = 0;
+                if (fn(vms, 1, &count) == JNI_OK && count > 0) {
+                    g_jvm = vms[0];
+                    __android_log_print(ANDROID_LOG_DEBUG, "simplehttp",
+                        "JVM via JNI_GetCreatedJavaVMs in %s", candidates[i]);
+                    dlclose(h);
+                    return g_jvm;
+                }
+            }
+            /* Try GlobalRef->jvm */
+            JavaVM *jvm = jvm_from_globalref(h);
+            if (jvm) {
+                g_jvm = jvm;
+                __android_log_print(ANDROID_LOG_DEBUG, "simplehttp",
+                    "JVM via GlobalRef->jvm in %s", candidates[i]);
+                dlclose(h);
+                return g_jvm;
+            }
+            dlclose(h);
+        }
+        __android_log_print(ANDROID_LOG_DEBUG, "simplehttp",
+            "strategy 2 (named dlopen) failed");
+    }
+
+    /* Strategy 3: scan all visible libraries via dl_iterate_phdr */
     __android_log_print(ANDROID_LOG_DEBUG, "simplehttp",
-        "RTLD_DEFAULT failed, searching libfcitx5android.so...");
-    dl_iterate_phdr(find_jvm_in_fcitx, &g_jvm);
+        "strategy 3: scanning all phdr libraries...");
+    PhdrSearch s = {NULL, 0};
+    dl_iterate_phdr(phdr_search_cb, &s);
+    __android_log_print(ANDROID_LOG_DEBUG, "simplehttp",
+        "strategy 3: scanned %d libraries total", s.count);
+    g_jvm = s.jvm;
 
-    if (!g_jvm) {
+    if (!g_jvm)
         __android_log_print(ANDROID_LOG_ERROR, "simplehttp",
-            "all JVM lookup strategies failed");
-    }
+            "all JVM strategies failed — network will not work");
     return g_jvm;
 }
 

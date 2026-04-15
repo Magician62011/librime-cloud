@@ -90,60 +90,87 @@ static int    lapi_ready = 0;
 /* JVM helpers                                                         */
 /* ------------------------------------------------------------------ */
 
-typedef jint (*get_vms_fn_t)(JavaVM **, jsize, jsize *);
+/* Obtain the JVM running in this process.
+ *
+ * Strategy 1: RTLD_DEFAULT (works on Android < 7 / some configs).
+ *
+ * Strategy 2: libfcitx5android.so is loaded via System.loadLibrary so
+ *   ART calls its JNI_OnLoad(JavaVM *jvm, ...) which stores the pointer
+ *   in GlobalRef (a GlobalRefSingleton* whose first member at offset 0
+ *   is JavaVM *jvm).  We walk loaded libraries with dl_iterate_phdr to
+ *   find the library's full path, dlopen(RTLD_NOLOAD) it, and read the
+ *   JavaVM out of GlobalRef->jvm.
+ *
+ * We do NOT try to dlopen libart.so: on Android 10+ it lives in the
+ * com_android_art APEX namespace which is inaccessible from the
+ * classloader-namespace even with RTLD_NOLOAD.
+ */
+static JavaVM *g_jvm = NULL;
 
-/* dl_iterate_phdr callback: search libart.so / libdvm.so for
-   JNI_GetCreatedJavaVMs and return the first one found. */
-static int find_jni_get_vms(struct dl_phdr_info *info, size_t size, void *data) {
-    if (!info->dlpi_name || !*info->dlpi_name) return 0;
-    if (!strstr(info->dlpi_name, "libart.so") &&
-        !strstr(info->dlpi_name, "libdvm.so"))
+static int find_jvm_in_fcitx(struct dl_phdr_info *info, size_t size, void *data) {
+    if (!info->dlpi_name || !strstr(info->dlpi_name, "libfcitx5android.so"))
         return 0;
     __android_log_print(ANDROID_LOG_DEBUG, "simplehttp",
-        "searching JNI_GetCreatedJavaVMs in: %s", info->dlpi_name);
+        "found libfcitx5android.so: %s", info->dlpi_name);
     void *h = dlopen(info->dlpi_name, RTLD_NOW | RTLD_NOLOAD);
-    if (!h) return 0;
-    get_vms_fn_t fn = (get_vms_fn_t)dlsym(h, "JNI_GetCreatedJavaVMs");
-    dlclose(h);
-    if (fn) {
-        *(get_vms_fn_t *)data = fn;
-        return 1; /* stop iteration */
+    if (!h) {
+        /* fall back to basename lookup */
+        h = dlopen("libfcitx5android.so", RTLD_NOW | RTLD_NOLOAD);
     }
-    return 0;
+    if (!h) {
+        __android_log_print(ANDROID_LOG_ERROR, "simplehttp",
+            "dlopen(libfcitx5android.so, RTLD_NOLOAD) failed: %s", dlerror());
+        return 1; /* stop — no point searching further */
+    }
+    /* GlobalRef is extern GlobalRefSingleton *GlobalRef (jni-utils.h).
+       GlobalRefSingleton::jvm is its first member at byte offset 0. */
+    void *sym = dlsym(h, "GlobalRef");
+    if (sym) {
+        void *obj = *(void **)sym;   /* dereference: GlobalRefSingleton * */
+        if (obj) {
+            *(JavaVM **)data = *(JavaVM **)obj;  /* .jvm at offset 0 */
+            __android_log_print(ANDROID_LOG_DEBUG, "simplehttp",
+                "JVM from GlobalRef->jvm: %p", *(void **)data);
+        } else {
+            __android_log_print(ANDROID_LOG_ERROR, "simplehttp",
+                "GlobalRef is null (JNI_OnLoad not yet called?)");
+        }
+    } else {
+        __android_log_print(ANDROID_LOG_ERROR, "simplehttp",
+            "dlsym(GlobalRef) failed: %s", dlerror());
+    }
+    dlclose(h);
+    return 1; /* stop iteration */
 }
-
-/* Obtain the JVM running in this process.
-   Strategy:
-   1. Try RTLD_DEFAULT (works on older Android / some configurations).
-   2. Walk all loaded libraries via dl_iterate_phdr to find libart.so
-      or libdvm.so directly — required on Android 7+ with namespace
-      isolation, and on Android 10+ where ART lives under /apex/. */
-static JavaVM *g_jvm = NULL;
 
 static JavaVM *get_jvm(void) {
     if (g_jvm) return g_jvm;
 
-    get_vms_fn_t fn = (get_vms_fn_t)dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs");
-    if (!fn) {
-        __android_log_print(ANDROID_LOG_DEBUG, "simplehttp",
-            "RTLD_DEFAULT dlsym failed, trying dl_iterate_phdr...");
-        dl_iterate_phdr(find_jni_get_vms, &fn);
-    }
-    if (!fn) {
-        __android_log_print(ANDROID_LOG_ERROR, "simplehttp",
-            "JNI_GetCreatedJavaVMs not found in any loaded library");
-        return NULL;
+    /* Strategy 1: RTLD_DEFAULT */
+    {
+        typedef jint (*fn_t)(JavaVM **, jsize, jsize *);
+        fn_t fn = (fn_t)dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs");
+        if (fn) {
+            JavaVM *vms[1] = {NULL};
+            jsize count = 0;
+            if (fn(vms, 1, &count) == JNI_OK && count > 0) {
+                g_jvm = vms[0];
+                __android_log_print(ANDROID_LOG_DEBUG, "simplehttp",
+                    "JVM via RTLD_DEFAULT: %p", (void *)g_jvm);
+                return g_jvm;
+            }
+        }
     }
 
-    JavaVM *vms[1] = {NULL};
-    jsize count = 0;
-    if (fn(vms, 1, &count) != JNI_OK || count == 0) {
+    /* Strategy 2: read GlobalRef->jvm from libfcitx5android.so */
+    __android_log_print(ANDROID_LOG_DEBUG, "simplehttp",
+        "RTLD_DEFAULT failed, searching libfcitx5android.so...");
+    dl_iterate_phdr(find_jvm_in_fcitx, &g_jvm);
+
+    if (!g_jvm) {
         __android_log_print(ANDROID_LOG_ERROR, "simplehttp",
-            "JNI_GetCreatedJavaVMs returned rc!=OK or count=0");
-        return NULL;
+            "all JVM lookup strategies failed");
     }
-    g_jvm = vms[0];
-    __android_log_print(ANDROID_LOG_DEBUG, "simplehttp", "JVM acquired: %p", (void *)g_jvm);
     return g_jvm;
 }
 

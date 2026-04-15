@@ -14,7 +14,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: prepare (Lua headers via thirdparty + Lua 5.4 source for link-time stub)
+    - name: prepare (Lua headers via thirdparty)
       working-directory: lib
       run: make prepare-android
 

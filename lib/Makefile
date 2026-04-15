@@ -49,18 +49,6 @@ lua-iconv-${LUA_ICONV_V}:
 	git clone -b v${LUA_ICONV_V} https://github.com/lunarmodules/lua-iconv.git lua-iconv-${LUA_ICONV_V}
 
 # Android NDK settings
-# LUA_STUB_V: Lua 5.4.x source used to build a link-time stub named librime.so.
-# The stub satisfies the linker so simplehttp.so gets NEEDED=librime.so.
-# At runtime the real librime.so from the fcitx5-android RIME plugin provides
-# all Lua symbols — the stub is never deployed to the device.
-LUA_STUB_V ?= 5.4.7
-LUA_STUB_SRC = lua-$(LUA_STUB_V)/src
-LUA_STUB_FILES = lapi.c lauxlib.c lbaselib.c lcode.c lcorolib.c lctype.c \
-	ldblib.c ldebug.c ldo.c ldump.c lfunc.c lgc.c linit.c liolib.c \
-	llex.c lmathlib.c lmem.c loadlib.c lobject.c lopcodes.c loslib.c \
-	lparser.c lstate.c lstring.c lstrlib.c ltable.c ltablib.c ltm.c \
-	lundump.c lutf8lib.c lvm.c lzio.c
-
 ANDROID_API ?= 21
 ANDROID_TRIPLE = aarch64-linux-android
 NDK ?= $(ANDROID_NDK_ROOT)
@@ -68,30 +56,19 @@ NDK_CLANG = $(NDK)/toolchains/llvm/prebuilt/linux-x86_64/bin/$(ANDROID_TRIPLE)$(
 
 prepare: librime-lua5.4 librime-lua5.4-x64 thirdparty curl-${CURLV} lua-iconv-${LUA_ICONV_V}
 
-prepare-android: thirdparty lua-$(LUA_STUB_V)
-
-lua-$(LUA_STUB_V):
-	curl -L -O https://www.lua.org/ftp/lua-$(LUA_STUB_V).tar.gz
-	tar xf lua-$(LUA_STUB_V).tar.gz
-
-# Link-time stub: Lua 5.4 compiled as a shared lib with soname=librime.so.
-# Only used during linking — never installed on-device.
-librime-lua-stub.so: lua-$(LUA_STUB_V)
-	$(NDK_CLANG) -shared -fPIC -DLUA_USE_POSIX \
-		-I$(LUA_STUB_SRC) \
-		-Wl,-soname,librime.so \
-		-o $@ \
-		$(addprefix $(LUA_STUB_SRC)/,$(LUA_STUB_FILES))
+prepare-android: thirdparty
 
 # Android arm64-v8a build of simplehttp.
-# Output has soname=simplehttp.so so Lua's dlopen resolves it correctly.
-simplehttp-android.so: simplehttp_android.c thirdparty librime-lua-stub.so
+# Lua symbols are left undefined at link time (--allow-shlib-undefined).
+# At runtime the already-loaded librime.so in the classloader-namespace
+# provides all Lua symbols — no NEEDED=librime.so file lookup needed.
+simplehttp-android.so: simplehttp_android.c thirdparty
 	$(NDK_CLANG) -shared -fPIC \
 		-I$(LUAINC) \
 		-Os -Wl,-s \
 		-Wl,-soname,simplehttp.so \
+		-Wl,--allow-shlib-undefined \
 		-o $@ simplehttp_android.c \
-		librime-lua-stub.so \
 		-llog
 
 curl-${CURLV}/build32/lib/.libs: curl-${CURLV}
@@ -128,7 +105,7 @@ iconvx64.dll: lua-iconv-${LUA_ICONV_V}/luaiconv.c librime-lua${LUAV}-x64 libicon
 
 clean:
 	rm -f simplehttp.so simplehttp.dll simplehttpx64.dll iconv.so iconv.dll iconvx64.dll
-	rm -f simplehttp-android.so librime-lua-stub.so
+	rm -f simplehttp-android.so
 
 purge: clean
 	rm -rf lua-iconv-* curl-* libiconv-* librime-* thirdparty lua-*

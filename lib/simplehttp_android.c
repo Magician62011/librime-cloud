@@ -106,6 +106,36 @@ static JavaVM *get_jvm(void) {
 /* HTTP request via java.net.HttpURLConnection                         */
 /* ------------------------------------------------------------------ */
 
+/* Log the pending Java exception class name, then clear it.
+   step: short label identifying where the failure happened. */
+static void log_exception(JNIEnv *env, const char *step) {
+    jthrowable ex = (*env)->ExceptionOccurred(env);
+    (*env)->ExceptionClear(env);
+    if (!ex) {
+        __android_log_print(ANDROID_LOG_ERROR, "simplehttp",
+            "FAIL at [%s]: no exception (null/0 return)", step);
+        return;
+    }
+    jclass cls = (*env)->GetObjectClass(env, ex);
+    jmethodID getName = (*env)->GetMethodID(env, cls, "getName", "()Ljava/lang/String;");
+    if (getName) {
+        jstring name = (jstring)(*env)->CallObjectMethod(env, cls, getName);
+        if (name) {
+            const char *cname = (*env)->GetStringUTFChars(env, name, NULL);
+            __android_log_print(ANDROID_LOG_ERROR, "simplehttp",
+                "FAIL at [%s]: exception = %s", step, cname ? cname : "(null)");
+            if (cname) (*env)->ReleaseStringUTFChars(env, name, cname);
+            (*env)->DeleteLocalRef(env, name);
+        }
+    } else {
+        (*env)->ExceptionClear(env); /* clear from failed GetMethodID */
+        __android_log_print(ANDROID_LOG_ERROR, "simplehttp",
+            "FAIL at [%s]: exception (class name unavailable)", step);
+    }
+    (*env)->DeleteLocalRef(env, cls);
+    (*env)->DeleteLocalRef(env, ex);
+}
+
 /*
  * Pushes 2 values onto the Lua stack:
  *   success: body_string, status_code
@@ -117,8 +147,12 @@ static int do_request(lua_State *L,
                       const char *post_data,
                       jsize      post_len,
                       jint       timeout_ms) {
+    __android_log_print(ANDROID_LOG_DEBUG, "simplehttp",
+        "do_request: %s %s", method, url);
+
     JavaVM *jvm = get_jvm();
     if (!jvm) {
+        __android_log_print(ANDROID_LOG_ERROR, "simplehttp", "JVM not available");
         lapi.lua_pushnil(L);
         lapi.lua_pushstring(L, "simplehttp: JVM not available");
         return 2;
@@ -129,24 +163,26 @@ static int do_request(lua_State *L,
     jint rc = (*jvm)->GetEnv(jvm, (void **)&env, JNI_VERSION_1_6);
     if (rc == JNI_EDETACHED) {
         if ((*jvm)->AttachCurrentThread(jvm, &env, NULL) != JNI_OK) {
+            __android_log_print(ANDROID_LOG_ERROR, "simplehttp", "AttachCurrentThread failed");
             lapi.lua_pushnil(L);
             lapi.lua_pushstring(L, "simplehttp: cannot attach thread to JVM");
             return 2;
         }
         attached = JNI_TRUE;
     } else if (rc != JNI_OK) {
+        __android_log_print(ANDROID_LOG_ERROR, "simplehttp", "GetEnv failed: %d", rc);
         lapi.lua_pushnil(L);
         lapi.lua_pushstring(L, "simplehttp: cannot get JNI env");
         return 2;
     }
 
-/* Clear pending exception and jump to fail */
-#define CHECK(expr) \
+/* Log exception class name, clear it, and jump to fail_labeled */
+#define CHKLOG(step, expr) \
     do { (expr); if ((*env)->ExceptionCheck(env)) \
-        { (*env)->ExceptionClear(env); goto fail; } } while (0)
-#define CHECKV(var, expr) \
+        { log_exception(env, step); goto fail; } } while (0)
+#define CHKVLOG(var, step, expr) \
     do { (var) = (expr); if (!(var) || (*env)->ExceptionCheck(env)) \
-        { (*env)->ExceptionClear(env); goto fail; } } while (0)
+        { log_exception(env, step); goto fail; } } while (0)
 
     jstring  jurl    = NULL;
     jstring  jmethod = NULL;
@@ -160,10 +196,11 @@ static int do_request(lua_State *L,
 
     /* Resolve classes */
     jclass URL_cls, HTTP_cls, OS_cls, IS_cls;
-    CHECKV(URL_cls,  (*env)->FindClass(env, "java/net/URL"));
-    CHECKV(HTTP_cls, (*env)->FindClass(env, "java/net/HttpURLConnection"));
-    CHECKV(OS_cls,   (*env)->FindClass(env, "java/io/OutputStream"));
-    CHECKV(IS_cls,   (*env)->FindClass(env, "java/io/InputStream"));
+    CHKVLOG(URL_cls,  "FindClass(URL)",              (*env)->FindClass(env, "java/net/URL"));
+    CHKVLOG(HTTP_cls, "FindClass(HttpURLConnection)",(*env)->FindClass(env, "java/net/HttpURLConnection"));
+    CHKVLOG(OS_cls,   "FindClass(OutputStream)",     (*env)->FindClass(env, "java/io/OutputStream"));
+    CHKVLOG(IS_cls,   "FindClass(InputStream)",      (*env)->FindClass(env, "java/io/InputStream"));
+    __android_log_print(ANDROID_LOG_DEBUG, "simplehttp", "FindClass: OK");
 
     /* Resolve methods */
     jmethodID URL_init  = (*env)->GetMethodID(env, URL_cls,  "<init>",            "(Ljava/lang/String;)V");
@@ -181,41 +218,50 @@ static int do_request(lua_State *L,
     jmethodID OS_close  = (*env)->GetMethodID(env, OS_cls,   "close",  "()V");
     jmethodID IS_read   = (*env)->GetMethodID(env, IS_cls,   "read",   "([B)I");
     jmethodID IS_close  = (*env)->GetMethodID(env, IS_cls,   "close",  "()V");
-    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); goto fail; }
+    if ((*env)->ExceptionCheck(env)) { log_exception(env, "GetMethodID"); goto fail; }
+    __android_log_print(ANDROID_LOG_DEBUG, "simplehttp", "GetMethodID: OK");
 
-    /* Create URL and open connection */
-    CHECKV(jurl,    (*env)->NewStringUTF(env, url));
-    CHECKV(url_obj, (*env)->NewObject(env, URL_cls, URL_init, jurl));
-    CHECKV(conn,    (*env)->CallObjectMethod(env, url_obj, URL_open));
+    /* Create URL object */
+    CHKVLOG(jurl,    "NewStringUTF(url)",  (*env)->NewStringUTF(env, url));
+    CHKVLOG(url_obj, "URL.<init>",         (*env)->NewObject(env, URL_cls, URL_init, jurl));
+    __android_log_print(ANDROID_LOG_DEBUG, "simplehttp", "URL object created");
+
+    /* Open connection */
+    CHKVLOG(conn, "openConnection", (*env)->CallObjectMethod(env, url_obj, URL_open));
+    __android_log_print(ANDROID_LOG_DEBUG, "simplehttp", "openConnection: OK");
 
     /* Set request method */
-    CHECKV(jmethod, (*env)->NewStringUTF(env, method));
-    CHECK((*env)->CallVoidMethod(env, conn, H_setmeth, jmethod));
+    CHKVLOG(jmethod, "NewStringUTF(method)", (*env)->NewStringUTF(env, method));
+    CHKLOG("setRequestMethod", (*env)->CallVoidMethod(env, conn, H_setmeth, jmethod));
 
     /* Set timeouts */
     if (timeout_ms > 0) {
         (*env)->CallVoidMethod(env, conn, H_ctout, timeout_ms);
         (*env)->CallVoidMethod(env, conn, H_rtout, timeout_ms);
+        if ((*env)->ExceptionCheck(env)) { log_exception(env, "setTimeout"); goto fail; }
     }
 
     /* POST body */
     if (post_data && post_len > 0) {
         jbyteArray jbody;
-        CHECKV(jbody, (*env)->NewByteArray(env, post_len));
+        CHKVLOG(jbody, "NewByteArray", (*env)->NewByteArray(env, post_len));
         (*env)->SetByteArrayRegion(env, jbody, 0, post_len, (const jbyte *)post_data);
-        CHECK((*env)->CallVoidMethod(env, conn, H_doout, JNI_TRUE));
+        CHKLOG("setDoOutput", (*env)->CallVoidMethod(env, conn, H_doout, JNI_TRUE));
         jobject os;
-        CHECKV(os, (*env)->CallObjectMethod(env, conn, H_getos));
+        CHKVLOG(os, "getOutputStream", (*env)->CallObjectMethod(env, conn, H_getos));
         (*env)->CallVoidMethod(env, os, OS_write, jbody);
         (*env)->CallVoidMethod(env, os, OS_flush);
         (*env)->CallVoidMethod(env, os, OS_close);
         (*env)->DeleteLocalRef(env, jbody);
         (*env)->DeleteLocalRef(env, os);
+        if ((*env)->ExceptionCheck(env)) { log_exception(env, "writePostBody"); goto fail; }
     }
 
     /* Trigger connection and get status code */
+    __android_log_print(ANDROID_LOG_DEBUG, "simplehttp", "calling getResponseCode...");
     code = (*env)->CallIntMethod(env, conn, H_code);
-    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); goto fail; }
+    if ((*env)->ExceptionCheck(env)) { log_exception(env, "getResponseCode"); goto fail; }
+    __android_log_print(ANDROID_LOG_DEBUG, "simplehttp", "HTTP status: %d", (int)code);
 
     /* Read response body */
     is_obj = (*env)->CallObjectMethod(env, conn, H_getis);
@@ -224,12 +270,14 @@ static int do_request(lua_State *L,
            Return empty body with the error code so the Lua caller
            can check the status and discard gracefully. */
         (*env)->ExceptionClear(env);
+        __android_log_print(ANDROID_LOG_DEBUG, "simplehttp",
+            "getInputStream threw (non-2xx?), returning empty body, code=%d", (int)code);
         lapi.lua_pushlstring(L, "", 0);
         lapi.lua_pushinteger(L, (lua_Integer)code);
         goto cleanup;
     }
 
-    CHECKV(chunk, (*env)->NewByteArray(env, 8192));
+    CHKVLOG(chunk, "NewByteArray(8192)", (*env)->NewByteArray(env, 8192));
     for (;;) {
         jint n = (*env)->CallIntMethod(env, is_obj, IS_read, chunk);
         if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); break; }
@@ -242,6 +290,8 @@ static int do_request(lua_State *L,
     }
     (*env)->CallVoidMethod(env, is_obj, IS_close);
 
+    __android_log_print(ANDROID_LOG_DEBUG, "simplehttp",
+        "response body: %zu bytes, code=%d", body_len, (int)code);
     lapi.lua_pushlstring(L, body ? body : "", body_len);
     lapi.lua_pushinteger(L, (lua_Integer)code);
     goto cleanup;
@@ -264,8 +314,8 @@ cleanup:
 
     if (attached) (*jvm)->DetachCurrentThread(jvm);
 
-#undef CHECK
-#undef CHECKV
+#undef CHKLOG
+#undef CHKVLOG
 
     return 2;
 }

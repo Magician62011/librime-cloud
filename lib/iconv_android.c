@@ -11,6 +11,15 @@
  * Lua symbols are resolved at runtime using the same function-pointer
  * approach as simplehttp_android.c — zero undefined Lua symbols at
  * link time. See that file for a detailed explanation of the mechanism.
+ *
+ * Implementation note: This module avoids lua_newuserdata / luaL_newmetatable
+ * / lua_setmetatable / luaL_checkudata because those auxlib / advanced-core
+ * symbols may not be exported by the host librime.so.  Instead, iconv.new()
+ * returns a plain table whose "iconv" field is a C closure that captures the
+ * iconv_t handle as a lua_Integer upvalue.  The object protocol cd:iconv(str)
+ * is fully preserved; GC of the underlying C handle is not performed (the
+ * handle leaks when the table is collected), which is acceptable for the
+ * one-or-few handles opened by a cloud-pinyin script.
  */
 
 /* iconv functions are declared manually rather than via <iconv.h>.
@@ -30,6 +39,7 @@ extern int     iconv_close(iconv_t cd);
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <stdint.h>   /* uintptr_t */
 #include <android/log.h>
 
 /* ------------------------------------------------------------------ */
@@ -41,6 +51,8 @@ typedef long long        lua_Integer;
 typedef int (*lua_CFunction)(lua_State *L);
 
 #define LUA_REGISTRYINDEX   (-1000000 - 1000)
+/* upvalue pseudo-index: upvalue i of the running C closure */
+#define lua_upvalueindex(i) (LUA_REGISTRYINDEX - (i))
 
 /* ------------------------------------------------------------------ */
 /* Lua API function pointer table                                      */
@@ -55,10 +67,8 @@ typedef struct {
     void        (*lua_pushcclosure)  (lua_State *L, lua_CFunction fn, int n);
     void        (*lua_createtable)   (lua_State *L, int narr, int nrec);
     void        (*lua_setfield)      (lua_State *L, int idx, const char *k);
-    void       *(*lua_newuserdata)   (lua_State *L, size_t sz);
-    int         (*luaL_newmetatable) (lua_State *L, const char *tname);
-    int         (*lua_setmetatable)  (lua_State *L, int objindex);
-    void       *(*luaL_checkudata)   (lua_State *L, int ud, const char *tname);
+    void        (*lua_pushinteger)   (lua_State *L, lua_Integer n);
+    lua_Integer (*lua_tointegerx)    (lua_State *L, int idx, int *isnum);
     const char *(*luaL_checklstring) (lua_State *L, int arg, size_t *l);
 } LuaAPI;
 
@@ -69,37 +79,27 @@ static int    lapi_ready = 0;
 #define lua_newtable(L) lapi.lua_createtable((L), 0, 0)
 
 /* ------------------------------------------------------------------ */
-/* iconv handle userdata                                               */
+/* cd:iconv(str) — the iconv_t handle is captured as upvalue 1        */
 /* ------------------------------------------------------------------ */
 
-#define ICONV_META "iconv_cd"
-
-typedef struct { iconv_t cd; } IconvHandle;
-
-/* __gc: called when Lua GC collects the converter object */
-static int iconv_gc(lua_State *L) {
-    IconvHandle *h = (IconvHandle *)lapi.luaL_checkudata(L, 1, ICONV_META);
-    if (h->cd != (iconv_t)-1) {
-        iconv_close(h->cd);
-        h->cd = (iconv_t)-1;
-    }
-    return 0;
-}
-
-/* cd:iconv(str)  →  result  or  nil, errmsg */
+/* cd:iconv(str)  →  result  or  nil, errmsg
+ * self (the table) is at index 1; str is at index 2.
+ * iconv_t handle is stored as a lua_Integer in upvalue 1. */
 static int iconv_convert(lua_State *L) {
-    IconvHandle *h = (IconvHandle *)lapi.luaL_checkudata(L, 1, ICONV_META);
-    if (h->cd == (iconv_t)-1) {
+    int isnum = 0;
+    lua_Integer h_int = lapi.lua_tointegerx(L, lua_upvalueindex(1), &isnum);
+    if (!isnum) {
         lapi.lua_pushnil(L);
-        lapi.lua_pushstring(L, "converter is closed");
+        lapi.lua_pushstring(L, "invalid iconv handle");
         return 2;
     }
+    iconv_t cd = (iconv_t)(uintptr_t)h_int;
 
     size_t inlen;
     const char *inbuf = lapi.luaL_checklstring(L, 2, &inlen);
 
     /* Reset shift state before each conversion */
-    iconv(h->cd, NULL, NULL, NULL, NULL);
+    iconv(cd, NULL, NULL, NULL, NULL);
 
     /* Worst-case output: UTF-8 is at most 4 bytes per code point,
        UTF-16LE input is 2 bytes per code point → factor of 2 is enough,
@@ -117,7 +117,7 @@ static int iconv_convert(lua_State *L) {
     size_t inleft  = inlen;
     size_t outleft = outsize;
 
-    size_t rc = iconv(h->cd, &inp, &inleft, &outp, &outleft);
+    size_t rc = iconv(cd, &inp, &inleft, &outp, &outleft);
     if (rc == (size_t)-1) {
         const char *err = strerror(errno);
         free(outbuf);
@@ -130,6 +130,11 @@ static int iconv_convert(lua_State *L) {
     free(outbuf);
     return 1;   /* success: only the converted string, no error value */
 }
+
+/* ------------------------------------------------------------------ */
+/* iconv.new(to, from)                                                 */
+/* Returns a table { iconv = <C closure capturing iconv_t as integer> */
+/* ------------------------------------------------------------------ */
 
 /* iconv.new(to, from)  →  cd  or  nil, errmsg */
 static int iconv_new(lua_State *L) {
@@ -144,23 +149,14 @@ static int iconv_new(lua_State *L) {
         return 2;
     }
 
-    IconvHandle *h = (IconvHandle *)lapi.lua_newuserdata(L, sizeof(IconvHandle));
-    h->cd = cd;
+    /* Build: table = { iconv = closure(cd) }
+     * Stack layout after each operation:
+     *   [1]=to  [2]=from  ... → we build on top */
 
-    /* Attach metatable (created once, reused on subsequent calls) */
-    if (lapi.luaL_newmetatable(L, ICONV_META)) {
-        /* First call: populate the metatable */
-        lapi.lua_pushcclosure(L, iconv_gc, 0);
-        lapi.lua_setfield(L, -2, "__gc");
-
-        /* __index = metatable itself so cd:iconv() lookup works */
-        lapi.lua_pushvalue(L, -1);
-        lapi.lua_setfield(L, -2, "__index");
-
-        lapi.lua_pushcclosure(L, iconv_convert, 0);
-        lapi.lua_setfield(L, -2, "iconv");
-    }
-    lapi.lua_setmetatable(L, -2);   /* pops metatable, attaches to userdata */
+    lua_newtable(L);                                      /* [.. table] */
+    lapi.lua_pushinteger(L, (lua_Integer)(uintptr_t)cd);  /* [.. table int] */
+    lapi.lua_pushcclosure(L, iconv_convert, 1);           /* [.. table closure] */
+    lapi.lua_setfield(L, -2, "iconv");                    /* [.. table] */
     return 1;
 }
 
@@ -205,10 +201,8 @@ static int resolve_lua_api(void) {
     RESOLVE(lua_pushcclosure);
     RESOLVE(lua_createtable);
     RESOLVE(lua_setfield);
-    RESOLVE(lua_newuserdata);
-    RESOLVE(luaL_newmetatable);
-    RESOLVE(lua_setmetatable);
-    RESOLVE(luaL_checkudata);
+    RESOLVE(lua_pushinteger);
+    RESOLVE(lua_tointegerx);
     RESOLVE(luaL_checklstring);
 
     dlclose(h);

@@ -13,7 +13,17 @@
  * link time. See that file for a detailed explanation of the mechanism.
  */
 
-#include <iconv.h>
+/* iconv functions are declared manually rather than via <iconv.h>.
+   The header was only added to NDK public API at API level 28, but the
+   functions have been present in Bionic libc since API 21 at runtime.
+   We declare them ourselves to avoid the header restriction — the same
+   approach used for Lua symbols throughout this project. */
+typedef void *iconv_t;
+extern iconv_t iconv_open(const char *tocode, const char *fromcode);
+extern size_t  iconv(iconv_t cd, char **inbuf,  size_t *inbytesleft,
+                                 char **outbuf, size_t *outbytesleft);
+extern int     iconv_close(iconv_t cd);
+
 #include <dlfcn.h>
 #include <link.h>
 #include <stdlib.h>

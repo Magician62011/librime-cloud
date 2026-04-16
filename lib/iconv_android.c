@@ -18,6 +18,7 @@
    functions have been present in Bionic libc since API 21 at runtime.
    We declare them ourselves to avoid the header restriction — the same
    approach used for Lua symbols throughout this project. */
+#include <stddef.h>   /* size_t */
 typedef void *iconv_t;
 extern iconv_t iconv_open(const char *tocode, const char *fromcode);
 extern size_t  iconv(iconv_t cd, char **inbuf,  size_t *inbytesleft,

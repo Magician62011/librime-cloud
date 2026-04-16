@@ -71,6 +71,16 @@ simplehttp-android.so: simplehttp_android.c
 		-o $@ simplehttp_android.c \
 		-llog -ldl
 
+# Android arm64-v8a build of iconv.
+# Uses Bionic libc's built-in iconv (available since API 21) — no
+# external libiconv needed. Same zero-Lua-symbol pattern as simplehttp.
+iconv-android.so: iconv_android.c
+	$(NDK_CLANG) -shared -fPIC \
+		-Os -Wl,-s \
+		-Wl,-soname,iconv.so \
+		-o $@ iconv_android.c \
+		-llog -ldl
+
 curl-${CURLV}/build32/lib/.libs: curl-${CURLV}
 	cd curl-${CURLV} && sh ../tinycurl.sh
 

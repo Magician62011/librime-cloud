@@ -372,7 +372,6 @@ static int do_request(lua_State *L,
     CHKVLOG(HTTP_cls, "FindClass(HttpURLConnection)",(*env)->FindClass(env, "java/net/HttpURLConnection"));
     CHKVLOG(OS_cls,   "FindClass(OutputStream)",     (*env)->FindClass(env, "java/io/OutputStream"));
     CHKVLOG(IS_cls,   "FindClass(InputStream)",      (*env)->FindClass(env, "java/io/InputStream"));
-    __android_log_print(ANDROID_LOG_DEBUG, "simplehttp", "FindClass: OK");
 
     /* Resolve methods */
     jmethodID URL_init  = (*env)->GetMethodID(env, URL_cls,  "<init>",            "(Ljava/lang/String;)V");
@@ -391,16 +390,13 @@ static int do_request(lua_State *L,
     jmethodID IS_read   = (*env)->GetMethodID(env, IS_cls,   "read",   "([B)I");
     jmethodID IS_close  = (*env)->GetMethodID(env, IS_cls,   "close",  "()V");
     if ((*env)->ExceptionCheck(env)) { log_exception(env, "GetMethodID"); goto fail; }
-    __android_log_print(ANDROID_LOG_DEBUG, "simplehttp", "GetMethodID: OK");
 
     /* Create URL object */
     CHKVLOG(jurl,    "NewStringUTF(url)",  (*env)->NewStringUTF(env, url));
     CHKVLOG(url_obj, "URL.<init>",         (*env)->NewObject(env, URL_cls, URL_init, jurl));
-    __android_log_print(ANDROID_LOG_DEBUG, "simplehttp", "URL object created");
 
     /* Open connection */
     CHKVLOG(conn, "openConnection", (*env)->CallObjectMethod(env, url_obj, URL_open));
-    __android_log_print(ANDROID_LOG_DEBUG, "simplehttp", "openConnection: OK");
 
     /* Set request method */
     CHKVLOG(jmethod, "NewStringUTF(method)", (*env)->NewStringUTF(env, method));
@@ -430,7 +426,6 @@ static int do_request(lua_State *L,
     }
 
     /* Trigger connection and get status code */
-    __android_log_print(ANDROID_LOG_DEBUG, "simplehttp", "calling getResponseCode...");
     code = (*env)->CallIntMethod(env, conn, H_code);
     if ((*env)->ExceptionCheck(env)) { log_exception(env, "getResponseCode"); goto fail; }
     __android_log_print(ANDROID_LOG_DEBUG, "simplehttp", "HTTP status: %d", (int)code);

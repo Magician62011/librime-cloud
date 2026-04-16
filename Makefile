@@ -17,9 +17,10 @@ macos:
 	tar czvf macos-`uname -m`-lua5.4.tar.gz out-macos scripts README.md
 
 android:
-	cd lib && make clean simplehttp-android.so
+	cd lib && make clean simplehttp-android.so iconv-android.so
 	rm -rf out-android && mkdir out-android
 	cp lib/simplehttp-android.so out-android/simplehttp.so
+	cp lib/iconv-android.so out-android/iconv.so
 	tar czvf android-arm64-v8a-lua5.4.tar.gz out-android scripts README.md
 
 clean:
